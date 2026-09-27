@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# fgps: manage the Family GPS server. Run `fgps help`.
+set -euo pipefail
+
+[ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
+
+CALLER_PWD="$PWD"
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+cd "$DIR"
+
+DATA="$DIR/data"
+USERS="$DATA/users.txt"          # name:bcrypt-hash, one per tracked phone
+SECRETS="$DATA/secrets"          # <name>.pw, plaintext phone passwords (to regenerate QR codes)
+PLACES="$DATA/places.json"       # geofences sent to every phone
+DEVICE=phone
+NTFY_TOPIC=family
+
+log() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
+die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+dc() { docker compose "$@"; }
+env_get() { sed -n "s/^$1=//p" .env 2>/dev/null | tail -n1; }
+env_set() {
+  if grep -q "^$1=" .env 2>/dev/null; then sed -i "s|^$1=.*|$1=$2|" .env; else echo "$1=$2" >> .env; fi
+}
+randpw() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-20}" || true; }
+valid_name() { [[ "$1" =~ ^[a-z][a-z0-9]{0,15}$ ]] || die "name must be lowercase letters/digits, e.g. alice"; }
+has_user() { grep -q "^$1:" "$USERS" 2>/dev/null; }
+users() { cut -d: -f1 "$USERS" 2>/dev/null || true; }
+ntfy() { dc exec -T ntfy ntfy "$@"; }
+
+domain() {
+  local d
+  d="$(dc exec -T tailscale tailscale status --json 2>/dev/null | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+if s.get("BackendState") == "Running":
+    print((s.get("Self") or {}).get("DNSName", "").rstrip("."))
+' 2>/dev/null || true)"
+  [ -n "$d" ] || return 1
+  echo "$d"
+}
+
+# --- rendering --------------------------------------------------------------
+
+render_auth() {
+  local f="$DATA/auth/users.caddy" u h
+  if [ -s "$USERS" ]; then
+    { echo "basic_auth {"
+      while IFS=: read -r u h; do printf '\t%s %s\n' "$u" "$h"; done < "$USERS"
+      echo "}"; } > "$f.tmp"
+  else
+    echo 'respond "no users yet" 403' > "$f.tmp"
+  fi
+  mv "$f.tmp" "$f"
+  dc exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+    || die "caddy reload failed; check: fgps logs caddy"
+}
+
+# Everyone sees everyone (including themselves, which the apps need).
+render_friends() {
+  [ -s "$USERS" ] || return 0
+  local list u
+  list="$(python3 -c 'import json,sys; print(json.dumps([u+"/'"$DEVICE"'" for u in sys.argv[1:]], separators=(",",":")))' $(users))"
+  for u in $(users); do echo "$u-$DEVICE $list"; done | dc exec -T recorder ocat --load=friends
+}
+
+write_card() {
+  local u="$1" dir="$DATA/store/cards/$1"
+  mkdir -p "$dir"
+  python3 -c 'import json,sys; u=sys.argv[1]; print(json.dumps({"_type":"card","name":u.capitalize(),"tid":u[:2].upper()}))' "$u" > "$dir/$u.json"
+}
+
+# OwnTracks config tuned for low battery: significant-change mode, OS geofences, HTTP (no open connection).
+otrc() {
+  local u="$1" d
+  d="$(domain)" || die "Tailscale is not running; check: fgps status"
+  python3 - "$u" "$(cat "$SECRETS/$u.pw")" "$d" "$PLACES" "$DEVICE" <<'PY'
+import json, os, sys
+u, pw, domain, places, device = sys.argv[1:]
+wps = json.load(open(places)) if os.path.exists(places) else []
+print(json.dumps({
+    "_type": "configuration",
+    "mode": 3,                        # HTTP
+    "url": f"https://{domain}/pub",
+    "auth": True,
+    "username": u,
+    "password": pw,
+    "deviceId": device,
+    "tid": u[:2].upper(),
+    "monitoring": 1,                  # significant changes only
+    "locatorDisplacement": 500,       # metres
+    "locatorInterval": 900,           # seconds
+    "locatorPriority": 1,             # Android: balanced power
+    "ping": 60,                       # Android: minutes between "still alive" reports
+    "waypoints": [{"_type": "waypoint", **w} for w in wps],
+}, separators=(",", ":")))
+PY
+}
+
+# --- commands ---------------------------------------------------------------
+
+cmd_init() {  # internal: called by install.sh after Tailscale is up
+  local d
+  d="$(domain)" || die "Tailscale is not running"
+  env_set NTFY_BASE_URL "https://$d"
+  env_set NTFY_UPSTREAM_BASE_URL "https://ntfy.sh"
+  mkdir -p "$SECRETS"; chmod 700 "$SECRETS"
+  dc up -d ntfy
+  for _ in $(seq 15); do ntfy user list >/dev/null 2>&1 && break; sleep 1; done
+  if [ -z "$(env_get NTFY_TOKEN)" ]; then
+    ntfy user del alertbot >/dev/null 2>&1 || true
+    dc exec -T -e "NTFY_PASSWORD=$(randpw 32)" ntfy ntfy user add alertbot >/dev/null
+    ntfy access alertbot "$NTFY_TOPIC" write-only >/dev/null
+    env_set NTFY_TOKEN "$(ntfy token add alertbot 2>&1 | grep -o 'tk_[A-Za-z0-9]*' | head -n1)"
+    [ -n "$(env_get NTFY_TOKEN)" ] || die "could not create ntfy token"
+  fi
+  dc up -d
+  for _ in $(seq 15); do dc exec -T caddy true >/dev/null 2>&1 && break; sleep 1; done
+  render_auth
+  render_friends
+}
+
+cmd_add() {
+  local u="${1:-}"; valid_name "$u"
+  has_user "$u" && die "$u already exists (fgps qr $u to show the setup code again)"
+  local pw hash
+  pw="$(randpw 20)"
+  hash="$(dc exec -T caddy caddy hash-password --plaintext "$pw" | tr -d '\r\n')"
+  mkdir -p "$SECRETS"; chmod 700 "$SECRETS"
+  (umask 077; echo "$pw" > "$SECRETS/$u.pw")
+  echo "$u:$hash" >> "$USERS"
+  write_card "$u"
+  render_auth
+  render_friends
+  log "Added $u"
+  cmd_qr "$u"
+}
+
+cmd_remove() {
+  local u="${1:-}"; valid_name "$u"
+  has_user "$u" || die "no such user: $u"
+  sed -i "/^$u:/d" "$USERS"
+  rm -f "$SECRETS/$u.pw"
+  echo "$u-$DEVICE DELETE" | dc exec -T recorder ocat --load=friends
+  render_auth
+  render_friends
+  log "Removed $u (their location history is kept in data/store/rec/$u)"
+}
+
+cmd_qr() {
+  local u="${1:-}"; valid_name "$u"
+  has_user "$u" || die "no such user: $u"
+  local cfg; cfg="$(otrc "$u")"
+  if [ "${2:-}" = "--file" ]; then
+    (umask 077; echo "$cfg" > "$CALLER_PWD/$u.otrc")
+    log "Wrote $CALLER_PWD/$u.otrc; send it to the phone and open it with OwnTracks"
+    return
+  fi
+  echo
+  qrencode -t ansiutf8 "owntracks:///config?inline=$(printf '%s' "$cfg" | base64 -w0)"
+  cat <<EOF
+On $u's phone:
+  1. Install OwnTracks (App Store / Google Play)
+  2. Scan this QR code with the camera and open it in OwnTracks
+  3. Allow location access "Always" (Android: "Allow all the time")
+     and exempt OwnTracks from battery optimisation
+Can't scan? Run: fgps qr $u --file
+EOF
+}
+
+cmd_list() {
+  [ -s "$USERS" ] || { echo "no users yet: fgps add <name>"; return; }
+  local last
+  last="$(dc exec -T recorder curl -s http://127.0.0.1:8083/api/0/last 2>/dev/null || echo '[]')"
+  python3 - "$last" $(users) <<'PY'
+import json, sys, time
+last = {}
+try:
+    for l in json.loads(sys.argv[1]):
+        last[l.get("username")] = l
+except ValueError:
+    pass
+print(f"{'NAME':<12} {'LAST SEEN':<14} {'BATTERY':<8} PLACE")
+for u in sys.argv[2:]:
+    l = last.get(u)
+    if not l:
+        print(f"{u:<12} {'never':<14}"); continue
+    ago = int(time.time() - l.get("tst", 0)) // 60
+    seen = f"{ago} min ago" if ago < 120 else f"{ago // 60} h ago"
+    batt = f"{l['batt']}%" if "batt" in l else "-"
+    print(f"{u:<12} {seen:<14} {batt:<8} {l.get('addr') or '%.4f,%.4f' % (l.get('lat', 0), l.get('lon', 0))}")
+PY
+}
+
+cmd_place() {
+  local sub="${1:-list}"; shift || true
+  [ -f "$PLACES" ] || echo '[]' > "$PLACES"
+  case "$sub" in
+    add)
+      [ $# -ge 3 ] || die 'usage: fgps place add "<name>" <lat> <lon> [radius-metres]'
+      python3 - "$PLACES" "$@" <<'PY'
+import json, sys, time
+f, name, lat, lon, *rad = sys.argv[1:]
+wps = [w for w in json.load(open(f)) if w["desc"] != name]
+tst = max([int(time.time())] + [w["tst"] + 1 for w in wps])   # tst is the waypoint's id on the phone
+wps.append({"desc": name, "lat": float(lat), "lon": float(lon), "rad": int(rad[0]) if rad else 150, "tst": tst})
+json.dump(wps, open(f, "w"), indent=1)
+PY
+      log "Saved place \"$1\". Phones get it when they re-scan: fgps qr <name>" ;;
+    remove)
+      [ $# -ge 1 ] || die 'usage: fgps place remove "<name>"'
+      python3 -c 'import json,sys; f,n=sys.argv[1:]; json.dump([w for w in json.load(open(f)) if w["desc"]!=n], open(f,"w"), indent=1)' "$PLACES" "$1"
+      log "Removed \"$1\". Also delete it in OwnTracks on each phone (Regions), or it keeps alerting." ;;
+    list)
+      python3 - "$PLACES" <<'PY'
+import json, sys
+for w in json.load(open(sys.argv[1])):
+    print(f"{w['desc']:<20} {w['lat']:.5f},{w['lon']:.5f}  r={w['rad']}m")
+PY
+      ;;
+    *) die "usage: fgps place add|remove|list" ;;
+  esac
+}
+
+cmd_notify() {
+  local sub="${1:-list}" u="${2:-}"
+  case "$sub" in
+    add)
+      valid_name "$u"
+      local pw d; pw="$(randpw 20)"; d="$(domain)" || die "Tailscale is not running"
+      if ntfy user list 2>&1 | grep -q "^user $u "; then
+        dc exec -T -e "NTFY_PASSWORD=$pw" ntfy ntfy user change-pass "$u" >/dev/null
+      else
+        dc exec -T -e "NTFY_PASSWORD=$pw" ntfy ntfy user add "$u" >/dev/null
+      fi
+      ntfy access "$u" "$NTFY_TOPIC" read-only >/dev/null
+      cat <<EOF
+
+Alerts for $u. In the ntfy app (App Store / Google Play):
+  Settings -> Manage users -> Add user
+     Service URL : https://$d
+     Username    : $u
+     Password    : $pw
+  Then "+" -> Subscribe to topic
+     Topic       : $NTFY_TOPIC
+     Server      : "Use another server" -> https://$d
+     Android     : turn on "Instant delivery"
+(Password is shown once; run this again to reset it.)
+EOF
+      ;;
+    remove)
+      valid_name "$u"
+      ntfy user del "$u" >/dev/null
+      log "$u no longer receives alerts" ;;
+    list)
+      ntfy user list 2>&1 | grep '^user ' | grep -v '^user alertbot ' | awk '{print $2}' ;;
+    *) die "usage: fgps notify add|remove|list <name>" ;;
+  esac
+}
+
+cmd_backup() {
+  local out="${1:-$CALLER_PWD/family-gps-backup-$(date +%Y%m%d-%H%M%S).tgz}"
+  log "Stopping briefly for a consistent copy (phones queue points meanwhile)"
+  dc down >/dev/null 2>&1
+  (umask 077; tar -czf "$out" -C "$DIR" data .env)
+  dc up -d >/dev/null 2>&1
+  log "Backup: $out ($(du -h "$out" | cut -f1))"
+  echo "It contains passwords and the server's Tailscale identity: keep it private."
+}
+
+cmd_restore() {
+  local f="${1:-}"
+  [ -n "$f" ] || die "usage: fgps restore <backup.tgz>"
+  f="$(cd "$CALLER_PWD" && readlink -f "$f")"
+  [ -f "$f" ] || die "not found: $f"
+  read -r -p "Replace current data with $f? [y/N] " a </dev/tty
+  [ "$a" = y ] || exit 1
+  dc down >/dev/null 2>&1
+  local old="data.old-$(date +%Y%m%d-%H%M%S)"
+  [ -d data ] && mv data "$old"
+  tar -xzf "$f" -C "$DIR"
+  dc up -d >/dev/null 2>&1
+  log "Restored. Previous data kept in $DIR/$old (delete when happy)"
+}
+
+cmd_uninstall() {
+  echo "This backs up everything to $CALLER_PWD, then removes Family GPS from this machine."
+  read -r -p "Type 'yes' to continue: " a </dev/tty
+  [ "$a" = yes ] || exit 1
+  cmd_backup
+  dc down --rmi all >/dev/null 2>&1 || true
+  rm -f /usr/local/bin/fgps
+  cd / && rm -rf "$DIR"
+  cat <<EOF
+Removed. To move: on the new server run the installer with --restore <backup.tgz>.
+Don't run the same backup on two servers at once (they share one Tailscale identity).
+EOF
+}
+
+cmd_update() {
+  local repo branch
+  repo="$(env_get FGPS_REPO)"; branch="$(env_get FGPS_BRANCH)"
+  curl -fsSL "https://raw.githubusercontent.com/$repo/${branch:-main}/install.sh" \
+    | FGPS_REPO="$repo" FGPS_BRANCH="${branch:-main}" FGPS_DIR="$DIR" bash
+}
+
+cmd_status() {
+  dc ps --format 'table {{.Service}}\t{{.Status}}'
+  echo
+  local d; if d="$(domain)"; then
+    echo "Phones send to : https://$d/pub"
+    echo "Alerts (ntfy)  : https://$d"
+    echo "Map (tailnet)  : https://$d:8443"
+    echo
+    dc exec -T tailscale tailscale funnel status 2>/dev/null || true
+  else
+    echo "Tailscale is not running; check: fgps logs tailscale"
+  fi
+}
+
+cmd_help() {
+  cat <<'EOF'
+Usage: fgps <command>
+
+Family
+  add <name>                  add a phone and show its setup QR code
+  remove <name>               revoke a phone's access
+  list                        members, last seen, battery
+  qr <name> [--file]          show the setup QR code again (or write <name>.otrc)
+
+Places & alerts
+  place add "<name>" <lat> <lon> [radius-m]   add a geofence (e.g. Home, School)
+  place remove "<name>" | place list
+  notify add <name>           let someone receive arrive/leave alerts (ntfy app)
+  notify remove <name> | notify list
+
+Server
+  status | logs [service]     health and logs
+  backup [file]               everything in one .tgz (for moving servers)
+  restore <file>              restore a backup here
+  update                      pull the latest version from GitHub
+  uninstall                   back up, then remove everything
+EOF
+}
+
+case "${1:-help}" in
+  add) cmd_add "${2:-}" ;;
+  remove|rm) cmd_remove "${2:-}" ;;
+  list|ls) cmd_list ;;
+  qr) cmd_qr "${2:-}" "${3:-}" ;;
+  place) shift; cmd_place "$@" ;;
+  notify) shift; cmd_notify "$@" ;;
+  backup) cmd_backup "${2:-}" ;;
+  restore) cmd_restore "${2:-}" ;;
+  uninstall) cmd_uninstall ;;
+  update) cmd_update ;;
+  status) cmd_status ;;
+  logs) shift; dc logs -f --tail=100 "$@" ;;
+  domain) domain ;;
+  init) cmd_init ;;
+  help|-h|--help) cmd_help ;;
+  *) cmd_help; exit 1 ;;
+esac

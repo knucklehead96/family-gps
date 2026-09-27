@@ -1,0 +1,71 @@
+name: family-gps
+
+services:
+  # Tailscale sidecar: owns the network namespace that Caddy lives in.
+  #   :443  -> Funnel (public)  -> Caddy :8081 -> /pub: recorder (phones), rest: ntfy (alerts)
+  #   :8443 -> Serve  (tailnet) -> Caddy :8080 -> frontend map (you)
+  # Node identity lives in data/tailscale, so a restored backup keeps the same URL.
+  tailscale:
+    image: tailscale/tailscale:stable
+    environment:
+      TS_HOSTNAME: ${TS_HOSTNAME:-mrn-pi}
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_AUTH_ONCE: "true"
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_USERSPACE: "true"
+    volumes:
+      - ./data/tailscale:/var/lib/tailscale
+      - ./tailscale:/config:ro
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    network_mode: service:tailscale
+    depends_on: [tailscale, recorder, frontend, ntfy]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/auth:/etc/caddy/auth:ro
+      - ./data/caddy:/data
+    restart: unless-stopped
+
+  recorder:
+    image: owntracks/recorder:latest
+    environment:
+      OTR_PORT: "0"            # HTTP only, no MQTT broker
+      OTR_HTTPHOST: "0.0.0.0"
+      OTR_LUASCRIPT: /hooks/alerts.lua
+      NTFY_URL: http://ntfy:80
+      NTFY_TOPIC: family
+      NTFY_TOKEN: ${NTFY_TOKEN:-}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./data/store:/store
+      - ./hooks:/hooks:ro
+    restart: unless-stopped
+
+  frontend:
+    image: owntracks/frontend:latest
+    environment:
+      SERVER_HOST: recorder
+      SERVER_PORT: "8083"
+    restart: unless-stopped
+
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    command: serve
+    environment:
+      NTFY_BASE_URL: ${NTFY_BASE_URL:-}
+      # iOS only gets instant pushes through Apple, relayed via ntfy.sh. Only a
+      # hashed message ID leaves the Pi; the alert text is fetched from here.
+      NTFY_UPSTREAM_BASE_URL: ${NTFY_UPSTREAM_BASE_URL:-}
+      NTFY_LISTEN_HTTP: ":80"
+      NTFY_BEHIND_PROXY: "true"
+      NTFY_CACHE_FILE: /var/lib/ntfy/cache.db
+      NTFY_AUTH_FILE: /var/lib/ntfy/user.db
+      NTFY_AUTH_DEFAULT_ACCESS: deny-all
+      NTFY_ENABLE_LOGIN: "true"
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./data/ntfy:/var/lib/ntfy
+    restart: unless-stopped
