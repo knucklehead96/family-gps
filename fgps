@@ -336,6 +336,7 @@ Places & alerts
 
 Server
   status | logs [service]     health and logs
+  restart                     restart everything (e.g. after changing Tailscale settings)
   backup [file]               everything in one .tgz (for moving servers)
   restore <file>              restore a backup here
   update                      pull the latest version from GitHub
@@ -356,6 +357,8 @@ case "${1:-help}" in
   update) cmd_update ;;
   status) cmd_status ;;
   logs) shift; dc logs -f --tail=100 "$@" ;;
+  # Caddy shares Tailscale's network namespace, so it must restart after it.
+  restart) dc restart tailscale && dc restart caddy recorder frontend ntfy ;;
   domain) domain ;;
   init) cmd_init ;;
   help|-h|--help) cmd_help ;;

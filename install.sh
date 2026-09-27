@@ -67,6 +67,11 @@ EOF
   done
   [ -n "$domain" ] || die "Tailscale did not come up (bad or used auth key?). Check: fgps logs tailscale"
   log "Tailscale up: $domain"
+  if ! docker compose exec -T tailscale tailscale status --json </dev/null \
+      | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("CertDomains") else 1)'; then
+    warn "HTTPS certificates are not enabled, so Funnel can't start."
+    warn "Enable them: https://login.tailscale.com/admin/dns -> HTTPS Certificates, then run: fgps restart"
+  fi
 
   log "Configuring logins and alerts"
   fgps init </dev/null
