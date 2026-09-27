@@ -26,14 +26,15 @@ In the [admin console](https://login.tailscale.com/admin):
 Raspberry Pi OS Lite 64-bit (or any Debian/Ubuntu):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/knucklehead96/family-gps/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/knucklehead96/family-gps/main/install.sh | sudo bash -s -- --authkey tskey-auth-XXXX
 ```
 
 The installer:
 - installs Docker if it's missing
-- asks for the auth key
+- downloads the container images (a few minutes on a Pi)
 - starts everything
-- asks for family member names, showing a QR code for each
+
+Then add each family phone with `fgps add <name>`.
 
 Afterwards, in the Tailscale admin console, open the `mrn-pi` machine and choose **Disable key expiry**.
 
