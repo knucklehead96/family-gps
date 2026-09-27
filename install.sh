@@ -2,11 +2,14 @@
 # Family GPS installer. Safe to re-run: it updates files and keeps data/ and .env.
 #
 # Fresh install (auth key from https://login.tailscale.com/admin/settings/keys):
-#   curl -fsSL https://raw.githubusercontent.com/knucklehead96/family-gps/main/install.sh | sudo bash -s -- --authkey tskey-auth-XXXX
+#   curl -fsSL https://raw.githubusercontent.com/<github-user>/family-gps/main/install.sh | sudo bash -s -- --authkey tskey-auth-XXXX [--hostname my-pi]
 # Move to a new server (restore a `fgps backup` file; no key needed):
-#   curl -fsSL https://raw.githubusercontent.com/knucklehead96/family-gps/main/install.sh | sudo bash -s -- --restore ./family-gps-backup.tgz
+#   curl -fsSL https://raw.githubusercontent.com/<github-user>/family-gps/main/install.sh | sudo bash -s -- --restore ./family-gps-backup-XXXX.tgz
 # Update an existing install:
 #   fgps update
+#
+# Options: --authkey KEY  --hostname NAME (default family-gps)  --restore FILE  --dir DIR (default /opt/family-gps)
+# Forks: set REPO below, or pass FGPS_REPO=<you>/family-gps.
 set -euo pipefail
 
 # Everything runs inside main() so bash has read the whole script before any
@@ -17,10 +20,12 @@ main() {
   DIR="${FGPS_DIR:-/opt/family-gps}"
   RESTORE=""
   TS_AUTHKEY="${TS_AUTHKEY:-}"
+  HOSTNAME_="family-gps"
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --authkey) TS_AUTHKEY="$2"; shift 2 ;;
+      --hostname) HOSTNAME_="$2"; shift 2 ;;
       --restore) RESTORE="$(readlink -f "$2")"; shift 2 ;;
       --dir) DIR="$2"; shift 2 ;;
       *) die "unknown option: $1" ;;
@@ -29,6 +34,7 @@ main() {
 
   [ "$(id -u)" -eq 0 ] || die "run as root: curl ... | sudo bash -s -- ..."
   [ -z "$RESTORE" ] || [ -f "$RESTORE" ] || die "backup not found: $RESTORE"
+  [[ "$HOSTNAME_" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die "--hostname: lowercase letters, digits and dashes only"
 
   # Tailscale identity comes from an existing install, a backup, or a fresh auth key.
   # Check before anything slow happens.
@@ -182,7 +188,7 @@ prepare_data() {
     local tz
     tz="$(cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null || echo UTC)"
     cat > .env <<EOF
-TS_HOSTNAME=mrn-pi
+TS_HOSTNAME=$HOSTNAME_
 TZ=$tz
 FGPS_REPO=$REPO
 FGPS_BRANCH=$BRANCH

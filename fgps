@@ -22,6 +22,8 @@ env_get() { sed -n "s/^$1=//p" .env 2>/dev/null | tail -n1; }
 env_set() {
   if grep -q "^$1=" .env 2>/dev/null; then sed -i "s|^$1=.*|$1=$2|" .env; else echo "$1=$2" >> .env; fi
 }
+# Files written for the user (backups, .otrc) should belong to them, not root.
+give_back() { [ -z "${SUDO_USER:-}" ] || chown "$SUDO_USER:" "$@"; }
 randpw() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-20}" || true; }
 valid_name() { [[ "$1" =~ ^[a-z][a-z0-9]{0,15}$ ]] || die "name must be lowercase letters/digits, e.g. alice"; }
 has_user() { grep -q "^$1:" "$USERS" 2>/dev/null; }
@@ -153,6 +155,7 @@ cmd_qr() {
   local cfg; cfg="$(otrc "$u")"
   if [ "${2:-}" = "--file" ]; then
     (umask 077; echo "$cfg" > "$CALLER_PWD/$u.otrc")
+    give_back "$CALLER_PWD/$u.otrc"
     log "Wrote $CALLER_PWD/$u.otrc; send it to the phone and open it with OwnTracks"
     return
   fi
@@ -259,11 +262,12 @@ EOF
 }
 
 cmd_backup() {
-  local out="${1:-$CALLER_PWD/family-gps-backup-$(date +%Y%m%d-%H%M%S).tgz}"
+  local out="$CALLER_PWD/family-gps-backup-$(date +%Y%m%d-%H%M%S).tgz"
   log "Stopping briefly for a consistent copy (phones queue points meanwhile)"
   dc down >/dev/null 2>&1
   (umask 077; tar -czf "$out" -C "$DIR" data .env)
-  dc up -d >/dev/null 2>&1
+  give_back "$out"
+  [ "${1:-}" = --no-restart ] || dc up -d >/dev/null 2>&1
   log "Backup: $out ($(du -h "$out" | cut -f1))"
   echo "It contains passwords and the server's Tailscale identity: keep it private."
 }
@@ -287,13 +291,13 @@ cmd_uninstall() {
   echo "This backs up everything to $CALLER_PWD, then removes Family GPS from this machine."
   read -r -p "Type 'yes' to continue: " a </dev/tty
   [ "$a" = yes ] || exit 1
-  cmd_backup
+  cmd_backup --no-restart
   dc down --rmi all >/dev/null 2>&1 || true
   rm -f /usr/local/bin/fgps
   cd / && rm -rf "$DIR"
   cat <<EOF
-Removed. To move: on the new server run the installer with --restore <backup.tgz>.
-Don't run the same backup on two servers at once (they share one Tailscale identity).
+Removed. To move to a new server, copy the backup there and run the installer
+with --restore <backup.tgz> (see README: "Moving to a new server").
 EOF
 }
 
@@ -302,6 +306,11 @@ cmd_update() {
   repo="$(env_get FGPS_REPO)"; branch="$(env_get FGPS_BRANCH)"
   curl -fsSL "https://raw.githubusercontent.com/$repo/${branch:-main}/install.sh" \
     | FGPS_REPO="$repo" FGPS_BRANCH="${branch:-main}" FGPS_DIR="$DIR" bash
+}
+
+cmd_stop() {
+  dc stop
+  log "Stopped. Phones keep their points and send them when it's back (fgps start)."
 }
 
 cmd_status() {
@@ -336,9 +345,9 @@ Places & alerts
 
 Server
   status | logs [service]     health and logs
-  restart                     restart everything (e.g. after changing Tailscale settings)
-  backup [file]               everything in one .tgz (for moving servers)
-  restore <file>              restore a backup here
+  start | stop | restart      stop keeps all data; restart after changing Tailscale settings
+  backup                      everything in one .tgz in the current directory
+  restore <file>              restore a backup onto this install
   update                      pull the latest version from GitHub
   uninstall                   back up, then remove everything
 EOF
@@ -351,7 +360,7 @@ case "${1:-help}" in
   qr) cmd_qr "${2:-}" "${3:-}" ;;
   place) shift; cmd_place "$@" ;;
   notify) shift; cmd_notify "$@" ;;
-  backup) cmd_backup "${2:-}" ;;
+  backup) cmd_backup ;;
   restore) cmd_restore "${2:-}" ;;
   uninstall) cmd_uninstall ;;
   update) cmd_update ;;
@@ -359,6 +368,8 @@ case "${1:-help}" in
   logs) shift; dc logs -f --tail=100 "$@" ;;
   # Caddy shares Tailscale's network namespace, so it must restart after it.
   restart) dc restart tailscale && dc restart caddy recorder frontend ntfy ;;
+  start) dc up -d ;;
+  stop) cmd_stop ;;
   domain) domain ;;
   init) cmd_init ;;
   help|-h|--help) cmd_help ;;
