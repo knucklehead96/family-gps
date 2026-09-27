@@ -157,6 +157,9 @@ fetch_files() {
   mkdir -p "$DIR"
   cp -a "$tmp/." "$DIR/"
   rm -rf "$tmp"
+  # cp -a copies mktemp's 0700 onto $DIR, hiding fgps from non-root users.
+  # Secrets stay protected by data/ (0700) and .env (0600).
+  chmod 755 "$DIR"
   chmod +x "$DIR/fgps" "$DIR/install.sh"
   ln -sf "$DIR/fgps" /usr/local/bin/fgps
 }
